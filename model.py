@@ -38,6 +38,159 @@ def accuracy(logits: np.ndarray, y: np.ndarray) -> float:
     return float(np.mean(preds == y))
 
 
+class Conv2D:
+    """Single-stride conv with 'same' padding and KxK filters."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel: int = 3, seed: int = 0) -> None:
+        rng = np.random.default_rng(seed)
+        # He scaling for the conv fan-in (kernel*kernel*in_ch)
+        fan_in = kernel * kernel * in_ch
+        scale = np.sqrt(2.0 / fan_in)
+        self.w = rng.standard_normal((out_ch, in_ch, kernel, kernel)) * scale
+        self.b = np.zeros(out_ch)
+
+    def forward(self, X: np.ndarray) -> np.ndarray:
+        """X : (N, H, W, C_in) -> (N, H, W, C_out)."""
+        n, h, w, _ = X.shape
+        k = self.w.shape[2]
+        p = k // 2
+        xp = np.pad(X, ((0, 0), (p, p), (p, p), (0, 0)), mode="constant")
+        out = np.zeros((n, h, w, self.w.shape[0]), dtype=np.float32)
+        # w shape: (Cout, Cin, k, k)
+        for i in range(k):
+            for j in range(k):
+                window = xp[:, i : i + h, j : j + w, :]  # (N,H,W,Cin)
+                kernel = self.w[:, :, i, j]  # (Cout, Cin)
+                out += window @ kernel.T  # (N,H,W,Cout)
+        out += self.b[None, None, None, :]
+        return out
+
+    def backward(self, dout: np.ndarray, X: np.ndarray) -> tuple:
+        """Return (dX, grad_w, grad_b) given upstream gradient dout."""
+        n, h, w, _ = X.shape
+        k = self.w.shape[2]
+        p = k // 2
+        xp = np.pad(X, ((0, 0), (p, p), (p, p), (0, 0)), mode="constant")
+        dXp = np.zeros_like(xp, dtype=np.float32)
+        dw = np.zeros_like(self.w, dtype=np.float32)
+        db = dout.sum(axis=(0, 1, 2))
+
+        for i in range(k):
+            for j in range(k):
+                window = xp[:, i : i + h, j : j + w, :]  # (N,H,W,Cin)
+                kernel = self.w[:, :, i, j]  # (Cout, Cin)
+                # dw[c_out,c_in] = sum over N,H,W of window[n,h,w,c_in]*dout[n,h,w,c_out]
+                dw[:, :, i, j] += dout.reshape(-1, dout.shape[-1]).T @ window.reshape(-1, window.shape[-1])
+                # dXp patch = dout @ kernel
+                dXp[:, i : i + h, j : j + w, :] += dout @ kernel
+        dX = dXp[:, p : p + h, p : p + w, :]
+        return dX, dw, db
+
+
+class MaxPool2D:
+    """2x2 max pooling with stride 2, no padding."""
+
+    def forward(self, X: np.ndarray) -> np.ndarray:
+        """X : (N, H, W, C) with H,W even -> (N, H/2, W/2, C)."""
+        n, h, w, c = X.shape
+        h2, w2 = h // 2, w // 2
+        out = np.zeros((n, h2, w2, c), dtype=np.float32)
+        self._mask = np.zeros_like(X, dtype=bool)
+        for i in range(h2):
+            for j in range(w2):
+                patch = X[:, 2 * i : 2 * i + 2, 2 * j : 2 * j + 2, :]
+                m = patch.max(axis=(1, 2), keepdims=True)
+                out[:, i, j, :] = m[:, 0, 0, :]
+                self._mask[:, 2 * i : 2 * i + 2, 2 * j : 2 * j + 2, :] |= (
+                    patch == m
+                )
+        return out
+
+    def backward(self, dout: np.ndarray, X: np.ndarray) -> np.ndarray:
+        n, h, w, c = X.shape
+        h2, w2 = h // 2, w // 2
+        dX = np.zeros_like(X, dtype=np.float32)
+        for i in range(h2):
+            for j in range(w2):
+                dX[:, 2 * i : 2 * i + 2, 2 * j : 2 * j + 2, :] += (
+                    dout[:, i : i + 1, j : j + 1, :]
+                    * self._mask[:, 2 * i : 2 * i + 2, 2 * j : 2 * j + 2, :]
+                )
+        return dX
+
+
+class TinyCNN:
+    """
+    Tiny 2-layer CNN:
+    input 32x32x3
+      -> Conv 3x3, 8 filters, 'same' -> ReLU -> 2x2 maxpool  (-> 16x16x8)
+      -> flatten (2048) -> linear -> softmax (5)
+    """
+
+    def __init__(self, num_classes: int = 5, seed: int = 0) -> None:
+        self.conv = Conv2D(in_ch=3, out_ch=8, kernel=3, seed=seed)
+        self.pool = MaxPool2D()
+        rng = np.random.default_rng(seed + 100)
+        flat_dim = 16 * 16 * 8
+        self.w = rng.standard_normal((flat_dim, num_classes)) * np.sqrt(2.0 / flat_dim)
+        self.b = np.zeros(num_classes)
+
+    def forward(self, X: np.ndarray) -> np.ndarray:
+        X = X.astype(np.float32)
+        self._input = X
+        self._conv = relu(self.conv.forward(X))
+        self._pooled = self.pool.forward(self._conv)
+        flat = self._pooled.reshape(self._pooled.shape[0], -1)
+        return flat @ self.w + self.b
+
+    def backward(self, y: np.ndarray) -> dict:
+        n = y.shape[0]
+        logits = self._pooled.reshape(self._pooled.shape[0], -1) @ self.w + self.b
+        probs = softmax(logits)
+        onehot = np.zeros_like(probs)
+        onehot[np.arange(n), y] = 1.0
+        d_logits = (probs - onehot) / n  # (N, C)
+
+        dw = self._pooled.reshape(n, -1).T @ d_logits
+        db = d_logits.sum(axis=0)
+        d_flat = d_logits @ self.w.T  # (N, 2048)
+        d_pooled = d_flat.reshape(self._pooled.shape)
+
+        d_conv = self.pool.backward(d_pooled, self._conv)
+        d_conv_relu = d_conv * (self._conv > 0)
+        _, dconv_w, dconv_b = self.conv.backward(d_conv_relu, self._input)
+        return {
+            "w": dw,
+            "b": db,
+            "conv_w": dconv_w,
+            "conv_b": dconv_b,
+        }
+
+    def update(self, grads: dict, lr: float, velocity: dict | None = None, momentum: float = 0.0) -> dict:
+        if velocity is None:
+            velocity = {k: np.zeros_like(v) for k, v in grads.items()}
+        for k in grads:
+            velocity[k] = momentum * velocity[k] - lr * grads[k]
+            if k == "conv_w":
+                self.conv.w += velocity[k]
+            elif k == "conv_b":
+                self.conv.b += velocity[k]
+            else:
+                self.__dict__[k] += velocity[k]
+        return velocity
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return np.argmax(self.forward(X), axis=-1)
+
+    def count_params(self) -> int:
+        return (
+            self.conv.w.size
+            + self.conv.b.size
+            + self.w.size
+            + self.b.size
+        )
+
+
 class MLP:
     """
     Two-hidden-layer MLP on a flattened 32x32x3 image.
