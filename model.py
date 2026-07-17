@@ -38,6 +38,30 @@ def accuracy(logits: np.ndarray, y: np.ndarray) -> float:
     return float(np.mean(preds == y))
 
 
+def classification_report(logits: np.ndarray, y: np.ndarray, label_names: list[str]) -> str:
+    """Per-class precision/recall/f1/accuracy, printed as a table."""
+    preds = np.argmax(logits, axis=-1)
+    lines = ["", "Per-class report", "-" * 60]
+    header = f"{'class':<22}{'prec':>7}{'recall':>8}{'f1':>7}{'support':>9}"
+    lines.append(header)
+    overall_correct = 0
+    for i, name in enumerate(label_names):
+        tp = int(np.sum((preds == i) & (y == i)))
+        fp = int(np.sum((preds == i) & (y != i)))
+        fn = int(np.sum((preds != i) & (y == i)))
+        support = int(np.sum(y == i))
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        overall_correct += tp
+        lines.append(
+            f"{name:<22}{prec:>7.3f}{rec:>8.3f}{f1:>7.3f}{support:>9}"
+        )
+    lines.append("-" * 60)
+    lines.append(f"accuracy: {overall_correct / len(y):.4f}  (n={len(y)})")
+    return "\n".join(lines)
+
+
 class Conv2D:
     """Single-stride conv with 'same' padding and KxK filters."""
 
